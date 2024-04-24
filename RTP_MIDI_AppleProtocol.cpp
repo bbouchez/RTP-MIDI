@@ -44,7 +44,7 @@ void CRTP_MIDI::SendInvitation (bool DestControl)
 	Invit.CommandH='I';
 	Invit.CommandL='N';
 	Invit.ProtocolVersion=htonl(2);
-	Invit.InitiatorToken=htonl(Token);
+	Invit.InitiatorToken=htonl(this->InitiatorToken);
 	Invit.SSRC=htonl(SSRC);
 
 	if (NameLen>0)  
@@ -56,15 +56,15 @@ void CRTP_MIDI::SendInvitation (bool DestControl)
 	
 	memset (&AdrEmit, 0, sizeof(sockaddr_in));
 	AdrEmit.sin_family=AF_INET;
-	AdrEmit.sin_addr.s_addr=htonl(RemoteIP);
+	AdrEmit.sin_addr.s_addr=htonl(RemoteIPToInvite);
 	if (DestControl)
 	{
-		AdrEmit.sin_port=htons(RemoteControl);
+		AdrEmit.sin_port=htons(PartnerControlPort);
 		sendto(ControlSocket, (const char*)&Invit, sizeof(TSessionPacketNoName)+NameLen, 0, (const sockaddr*)&AdrEmit, sizeof(sockaddr_in));
 	}
 	else
 	{
-		AdrEmit.sin_port=htons(RemoteData);
+		AdrEmit.sin_port=htons(PartnerDataPort);
 		sendto(DataSocket, (const char*)&Invit, sizeof(TSessionPacketNoName)+NameLen, 0, (const sockaddr*)&AdrEmit, sizeof(sockaddr_in));
 	}
 } // CRTP_MIDI::SendInvitation
@@ -87,15 +87,15 @@ void CRTP_MIDI::SendBYCommand (void)
 	AdrEmit.sin_family=AF_INET;
 	//AdrEmit.sin_addr.s_addr=htonl(RemoteIP);
 	AdrEmit.sin_addr.s_addr=htonl(SessionPartnerIP);
-	AdrEmit.sin_port=htons(RemoteControl);
+	AdrEmit.sin_port=htons(PartnerControlPort);
 	sendto(ControlSocket, (const char*)&PacketBY, sizeof(TSessionPacketNoName), 0, (const sockaddr*)&AdrEmit, sizeof(sockaddr_in));
 } // CRTP_MIDI::SendBYCommand
 //---------------------------------------------------------------------------
 
-void CRTP_MIDI::SendInvitationReply (bool OnControl, bool Accept, char* Name)
+void CRTP_MIDI::SendInvitationReply (bool FromControlSocket, bool Accept, unsigned int DestinationIP, unsigned short DestinationPort)
 {
 	TSessionPacket Reply;
-	int Taille;
+	int Size;
 	sockaddr_in AdrEmit;
 	
 	Reply.Reserved1=0xFF;
@@ -111,31 +111,23 @@ void CRTP_MIDI::SendInvitationReply (bool OnControl, bool Accept, char* Name)
 		Reply.CommandL='O';
 	}
 	Reply.ProtocolVersion=htonl(2);
-	Reply.InitiatorToken=htonl(InitiatorToken);
-	Reply.SSRC=htonl(SSRC);
-	
-	/*
-	 if (Name<>nil) then begin
-	 strcopy(@Reply.Name[0], Name);
-	 Taille:=sizeof(TSessionPacketNoName)+strlen(Name)+1;
-	 end
-	 else */
-	Taille=sizeof(TSessionPacketNoName);
+	Reply.InitiatorToken=htonl(this->InitiatorToken);
+	Reply.SSRC=htonl(this->SSRC);
+
+	Size=sizeof(TSessionPacketNoName);
 	
 	memset (&AdrEmit, 0, sizeof(sockaddr_in));
 	AdrEmit.sin_family=AF_INET;
-	//AdrEmit.sin_addr.s_addr=htonl(RemoteIP);
-	if (OnControl)
+	AdrEmit.sin_addr.s_addr = htonl(DestinationIP);
+	AdrEmit.sin_port = htons(DestinationPort);
+
+	if (FromControlSocket)
 	{
-        AdrEmit.sin_addr.s_addr=htonl(InvitationOnCtrlSenderIP);
-		AdrEmit.sin_port=htons(RemoteControl);
-		sendto(ControlSocket, (const char*)&Reply, Taille, 0, (const sockaddr*)&AdrEmit, sizeof(sockaddr_in));
+		sendto(ControlSocket, (const char*)&Reply, Size, 0, (const sockaddr*)&AdrEmit, sizeof(sockaddr_in));
 	}
 	else
 	{
-        AdrEmit.sin_addr.s_addr=htonl(InvitationOnDataSenderIP);
-		AdrEmit.sin_port=htons(RemoteData);
-		sendto(DataSocket, (const char*)&Reply, Taille, 0, (const sockaddr*)&AdrEmit, sizeof(sockaddr_in));
+		sendto(DataSocket, (const char*)&Reply, Size, 0, (const sockaddr*)&AdrEmit, sizeof(sockaddr_in));
 	}
 }  // CRTP_MIDI::SendInvitationReply
 //---------------------------------------------------------------------------
@@ -164,7 +156,7 @@ void CRTP_MIDI::SendSyncPacket (char Count, unsigned int LTS1H, unsigned int LTS
 	memset (&AdrEmit, 0, sizeof(sockaddr_in));
 	AdrEmit.sin_family=AF_INET;
 	AdrEmit.sin_addr.s_addr=htonl(SessionPartnerIP);
-	AdrEmit.sin_port=htons(RemoteData);
+	AdrEmit.sin_port=htons(PartnerDataPort);
 	sendto(DataSocket, (const char*)&Sync, sizeof(TSyncPacket), 0, (const sockaddr*)&AdrEmit, sizeof(sockaddr_in));
 }  // CRTP_MIDI::SendSyncPacket
 //---------------------------------------------------------------------------
@@ -186,7 +178,7 @@ void CRTP_MIDI::SendFeedbackPacket (unsigned short LastNumber)
 	AdrEmit.sin_family=AF_INET;
 	//AdrEmit.sin_addr.s_addr=htonl(RemoteIP);
 	AdrEmit.sin_addr.s_addr=htonl(SessionPartnerIP);
-	AdrEmit.sin_port=htons(RemoteControl);
+	AdrEmit.sin_port=htons(PartnerControlPort);
 	sendto(ControlSocket, (const char*)&Feed, sizeof(TFeedbackPacket), 0, (const sockaddr*)&AdrEmit, sizeof(sockaddr_in));
 }  // CRTP_MIDI::SendFeedbackPacket
 //---------------------------------------------------------------------------

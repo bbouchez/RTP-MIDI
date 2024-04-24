@@ -63,7 +63,15 @@
   - Code cleaned to remove warnings (unreferenced local variables)
 
 04/01/2024
-  - update to MIT license for cross application use
+  - update to MIT license
+
+15/02/2024
+  - added capability to reject invitation if session is already opened
+  - total cleanup of the RunSession method
+  - added some missing __TARGET_LINUX__ directives
+
+16/04/2024
+  - added SetCallback method to declare callback and instance outside from constructor
  */
 
 #include "RTP_MIDI.h"
@@ -80,22 +88,19 @@
 
 CRTP_MIDI::CRTP_MIDI(unsigned int SYXInSize, TRTPMIDIDataCallback CallbackFunc, void* UserInstance)
 {
-	RemoteIP=DEFAULT_RTP_ADDRESS;
-	RemoteControl=DEFAULT_RTP_CTRL_PORT;
-	RemoteData=DEFAULT_RTP_DATA_PORT;
+	this->RemoteIPToInvite=0;
+	this->PartnerControlPort=0;
+	this->PartnerDataPort=0;
 
 	DataSocket=INVALID_SOCKET;
 	ControlSocket=INVALID_SOCKET;
 	SessionState=SESSION_CLOSED;
 
-    InvitationOnCtrlSenderIP=0;      // IP address of sender of invitation received on control port
-    InvitationOnDataSenderIP=0;      // IP address of sender of invitation received on data port
     SessionPartnerIP=0;
 	strcpy ((char*)&this->SessionName[0], "");
 
 	SocketLocked=true;
 	TimerRunning=false;
-	TimerEvent=false;
 	EventTime=0;
 
 	InviteCount=0;
@@ -103,13 +108,11 @@ CRTP_MIDI::CRTP_MIDI(unsigned int SYXInSize, TRTPMIDIDataCallback CallbackFunc, 
 	SyncSequenceCounter=0;
 	MeasuredLatency = 0xFFFFFFFF;		// Mark as latency not known for now
 
-	IsInitiatorNode=true;
-	TimeOutRemote=4;
-	ConnectionLost = false;
-	PeerClosedSession = false;
-
-	InterFragmentTimer=0;
-	TransmittedSYSEXInFragment=0;
+	this->IsInitiatorNode=true;
+	this->TimeOutRemote=4;
+	this->ConnectionLost = false;
+	this->PeerClosedSession = false;
+	this->ConnectionRefused = false;
 
 	InSYSEXBufferSize=SYXInSize;
 	InSYSEXBuffer=new unsigned char [InSYSEXBufferSize];
@@ -119,8 +122,8 @@ CRTP_MIDI::CRTP_MIDI(unsigned int SYXInSize, TRTPMIDIDataCallback CallbackFunc, 
 
 	initRTP_SYSEXBuffer();
 
-	RTPCallback=CallbackFunc;
-	ClientInstance=UserInstance;
+	this->RTPCallback=CallbackFunc;
+	this->ClientInstance=UserInstance;
 }  // CRTP_MIDI::CRTP_MIDI
 //---------------------------------------------------------------------------
 
@@ -146,7 +149,6 @@ void CRTP_MIDI::CloseSockets(void)
 void CRTP_MIDI::PrepareTimerEvent (unsigned int TimeToWait)
 {
 	TimerRunning=false;		// Lock the timer until preparation is done
-	TimerEvent=false;			// Signal no event
 	EventTime=TimeToWait;
 	TimerRunning=true;		// Restart the timer
 }  // CRTP_MIDI::PrepareTimerEvent
@@ -162,11 +164,11 @@ int CRTP_MIDI::InitiateSession(unsigned int DestIP,
     int CreateError=0;
 	bool SocketOK;
 
-	RemoteIP=DestIP;
-	RemoteControl=DestCtrlPort;
-	RemoteData=DestDataPort;
+	this->RemoteIPToInvite=DestIP;
+	this->PartnerControlPort=DestCtrlPort;
+	this->PartnerDataPort=DestDataPort;
 
-	Token=rand()*0xFFFFFFFF;
+	this->InitiatorToken=rand()*0xFFFFFFFF;
 	SSRC=rand()*0xFFFFFFFF;
 	RTPSequence=0;
 	LastRTPCounter=0;
@@ -195,15 +197,15 @@ int CRTP_MIDI::InitiateSession(unsigned int DestIP,
 		InviteCount=0;
 		TimeOutRemote=16;		// 120 seconds -> Five sync sequences every 1.5 seconds then sync sequence every 10 seconds = 11 + 5
 		IncomingThirdByte=false;
-		IsInitiatorNode=IsInitiator;
+		this->IsInitiatorNode=IsInitiator;
 		if (IsInitiator==false)
 		{  // Do not invite, wait from remote node to start session
-			SessionState=SESSION_WAIT_INVITE;
+			SessionState=SESSION_WAIT_INVITE_CTRL;
 		}
 		else
 		{ // Initiate session by inviting remote node
 			SessionState=SESSION_INVITE_CONTROL;
-            SessionPartnerIP=RemoteIP;
+            SessionPartnerIP=RemoteIPToInvite;
 		}
 		SocketLocked=false;		// Must be last instruction after session initialization
 		PrepareTimerEvent(1000);
@@ -215,462 +217,411 @@ int CRTP_MIDI::InitiateSession(unsigned int DestIP,
 
 void CRTP_MIDI::CloseSession (void)
 {
-	if (SessionState==SESSION_OPENED)
+	// Do not send BYE message if we are not completely connected when we are session listener
+	if (this->IsInitiatorNode == false)
 	{
-		SessionState=SESSION_CLOSED;
-		SendBYCommand();
-		SystemSleepMillis(50);		// Give time to send the message before closing the sockets
+		if (this->SessionState == SESSION_WAIT_INVITE_CTRL) return;
 	}
+
+	// Send the message in all other cases, even if we are still in invitation process
+	SessionState=SESSION_CLOSED;
+	SendBYCommand();
+	SystemSleepMillis(50);		// Give time to send the message before closing the sockets
 }  // CRTP_MIDI::CloseSession
 //---------------------------------------------------------------------------
 
-void CRTP_MIDI::RunSession(void)
+bool CRTP_MIDI::ProcessControlSocket(bool* InvitationAccepted, bool* InvitationRejected)
 {
 	int RecvSize;
-	int nRet;
+	unsigned char ReceptionBuffer[1024];
+	sockaddr_in SenderData;
+	TSessionPacket* SessionPacket;
+	unsigned int SenderIP;
+	unsigned short SenderPort;
+
 #if defined (__TARGET_MAC__)
-  socklen_t fromlen;
+	socklen_t fromlen;
 #endif
 #if defined (__TARGET_LINUX__)
-  socklen_t fromlen;
+	socklen_t fromlen;
 #endif
 #if defined (__TARGET_WIN__)
-  int fromlen;
+	int fromlen;
 #endif
-	sockaddr_in SenderData;
-	unsigned char ReceptionBuffer[1024];
-	bool InvitationReceivedOnCtrl;
-	bool InvitationReceivedOnData;
-	bool InvitationAcceptedOnCtrl;
-	bool InvitationAcceptedOnData;
-	bool InvitationRefusedOnCtrl;
-	bool InvitationRefusedOnData;
-
-	bool ClockSync0Received;
-	bool ClockSync1Received;
-	bool ClockSync2Received;
-
-	bool ByeReceivedOnCtrl;
-	bool ByeReceivedOnData;
-
-	TSessionPacket* SessionPacket;
-	TSyncPacket* SyncPacket;
-
-	TLongMIDIRTPMsg LRTPMessage;
-	sockaddr_in AdrEmit;
-	int RTPOutSize;
-
-	// Computing time using the thread is not perfect, we should use OS time related data
-	// timeGetTime can be used on Windows, but no direct equivalent in Mac
-	// TODO : enhance implementation using system time
-	TimeCounter+=10;
-    LocalClock+=10;
-
-	// Do not process if communication layers are not ready
-	if (SocketLocked) return;
-
-	// Check if timer elapsed
-	if (TimerRunning)
-	{
-		if (EventTime>0)
-			EventTime--;
-		if (EventTime==0)
-		{
-			TimerRunning=false;
-			TimerEvent=true;
-		}
-	}
-
-	// If no resync from remote node after 2 minutes and we are session initiator, then try to invite again the remote device
-	if ((TimeOutRemote==0)&&(SessionState==SESSION_OPENED))
-	{
-		ConnectionLost = true;
-		if (IsInitiatorNode)
-		{
-			TimeOutRemote=4;
-			RestartSession();
-		}
-		else
-		{  // If we are not session initiator, just wait to be invited again
-			SessionState=SESSION_WAIT_INVITE;
-		}
-	}
-
-	// Init state decoder
-	InvitationReceivedOnCtrl=false;
-	InvitationReceivedOnData=false;
-	InvitationAcceptedOnCtrl=false;
-	InvitationAcceptedOnData=false;
-	InvitationRefusedOnCtrl=false;
-	InvitationRefusedOnData=false;
-	ByeReceivedOnCtrl=false;
-	ByeReceivedOnData=false;
-
-	ClockSync0Received=false;
-	ClockSync1Received=false;
-	ClockSync2Received=false;
 
 	// Check if something has been received on control socket
 	if (DataAvail(ControlSocket, 0))
 	{
-		fromlen=sizeof(sockaddr_in);
-		RecvSize=(int)recvfrom(ControlSocket, (char*)&ReceptionBuffer, sizeof(ReceptionBuffer), 0, (sockaddr*)&SenderData, &fromlen);
+		fromlen = sizeof(sockaddr_in);
+		RecvSize = (int)recvfrom(ControlSocket, (char*)&ReceptionBuffer, sizeof(ReceptionBuffer), 0, (sockaddr*)&SenderData, &fromlen);
 
-		if (RecvSize>0)
-		{  // Check if message is sent from configured partner
-#if defined (__TARGET_WIN__)
-			if ((htonl(SenderData.sin_addr.S_un.S_addr)==RemoteIP)||(RemoteIP==0))
-#endif
-#if defined (__TARGET_MAC__)
-			if ((htonl(SenderData.sin_addr.s_addr)==RemoteIP)||(RemoteIP==0))
-#endif
+		if (RecvSize == 0) return false;
+
+		// Check if this is an Apple session message (ignore every other message received on this socket
+		if ((ReceptionBuffer[0] != 0xFF) || (ReceptionBuffer[1] != 0xFF)) return true;
+
+		SenderIP = htonl(SenderData.sin_addr.s_addr);
+		SenderPort = htons(SenderData.sin_port);
+		SessionPacket = (TSessionPacket*)&ReceptionBuffer[0];
+
+		if ((ReceptionBuffer[2] == 'I') && (ReceptionBuffer[3] == 'N'))
+		{  // We are being invited...
+			// If we are a session listener, start the invitation acceptance process
+			// TODO : if we don't get invitation on data after 5 seconds, return to SESSION_WAIT_INVITE_CTRL state
+			if (this->IsInitiatorNode == false)
 			{
-
-				// Check if this is an Apple session message
-				// This socket can react on two messages : INvitation and OK/NO (after inviting)
-				if ((ReceptionBuffer[0]==0xFF)&&(ReceptionBuffer[1]==0xFF))
+				if (this->SessionState == SESSION_WAIT_INVITE_CTRL)
 				{
-					if ((ReceptionBuffer[2]=='I')&&(ReceptionBuffer[3]=='N'))
-					{
-						SessionPacket=(TSessionPacket*)&ReceptionBuffer[0];
-						InitiatorToken=htonl(SessionPacket->InitiatorToken);
-						InvitationReceivedOnCtrl=true;
-                        // Store IP address and port from requestor, so we can send back the answer to correct destination
-                        // Note that we can have to answer to any requestor, so we do not use the programmed destination address even if we are session initiator
-                        InvitationOnCtrlSenderIP=htonl(SenderData.sin_addr.s_addr);
-						RemoteControl=htons(SenderData.sin_port);
-					}
-					else if ((ReceptionBuffer[2]=='O')&&(ReceptionBuffer[3]=='K')) InvitationAcceptedOnCtrl=true;
-					else if ((ReceptionBuffer[2]=='N')&&(ReceptionBuffer[3]=='O')) InvitationRefusedOnCtrl=true;
-					else if ((ReceptionBuffer[2]=='B')&&(ReceptionBuffer[3]=='Y')) ByeReceivedOnCtrl=true;
+					this->InitiatorToken = htonl(SessionPacket->InitiatorToken);
+					this->SessionState = SESSION_WAIT_INVITE_DATA;
+					PrepareTimerEvent(5000);
+					this->SendInvitationReply(true, true, SenderIP, SenderPort);
+					this->SessionPartnerIP = SenderIP;
+					this->PartnerControlPort = SenderPort;
 				}
-			}
-		}
-	}  // Reception on control socket
-
-	// Check if something has been received on data socket
-	if (DataAvail(DataSocket, 0))
-	{
-		fromlen=sizeof(sockaddr_in);
-		nRet=(int)recvfrom(DataSocket, (char*)&ReceptionBuffer, sizeof(ReceptionBuffer), 0, (sockaddr*)&SenderData, &fromlen);
-
-		if (nRet>0)
-		{
-#if defined (__TARGET_WIN__)
-			if ((htonl(SenderData.sin_addr.S_un.S_addr)==RemoteIP)||(RemoteIP==0))
-#endif
-#if defined (__TARGET_MAC__)
-				if ((htonl(SenderData.sin_addr.s_addr)==RemoteIP)||(RemoteIP==0))
-#endif
-			{
-				// Check if this is a RTP message
-				if (SessionState==SESSION_OPENED)
-				{
-					if ((ReceptionBuffer[0]==0x80)&&(ReceptionBuffer[1]==0x61))
-					{
-						ProcessIncomingRTP(&ReceptionBuffer[0]);
+				else
+				{  // We are already in the process of being invited, but this may be a repetition from the same source
+					if ((SenderIP == this->SessionPartnerIP) && (SenderPort == this->PartnerControlPort))
+					{  // This is a repetition of the invitation we already got : accept it
+						PrepareTimerEvent(5000);
+						this->SendInvitationReply(true, true, SenderIP, SenderPort);
 					}
-				}
-				// Check if this is an Apple session message
-				if ((ReceptionBuffer[0]==0xFF)&&(ReceptionBuffer[1]==0xFF))
-				{
-					if ((ReceptionBuffer[2]=='I')&&(ReceptionBuffer[3]=='N'))
-					{
-						SessionPacket=(TSessionPacket*)&ReceptionBuffer[0];
-						InitiatorToken=htonl(SessionPacket->InitiatorToken);
-						InvitationReceivedOnData=true;
-						RemoteData=htons(SenderData.sin_port);
-                        InvitationOnDataSenderIP=htonl(SenderData.sin_addr.s_addr);
-					}
-					else if ((ReceptionBuffer[2]=='O')&&(ReceptionBuffer[3]=='K')) InvitationAcceptedOnData=true;
-					else if ((ReceptionBuffer[2]=='N')&&(ReceptionBuffer[3]=='O')) InvitationRefusedOnData=true;
-					else if ((ReceptionBuffer[2]=='B')&&(ReceptionBuffer[3]=='Y')) ByeReceivedOnData=true;
-
-					// Check for synchronization message
-					else if ((ReceptionBuffer[2]=='C')&&(ReceptionBuffer[3]=='K'))
-					{
-						SyncPacket=(TSyncPacket*)&ReceptionBuffer[0];
-						if (SyncPacket->Count==0)
-						{
-							ClockSync0Received=true;
-#ifdef SHOW_RTP_INFO
-                            fprintf (stdout, "Clock sync 0 received %u %u\n", htonl(SyncPacket->TS1H), htonl(SyncPacket->TS1L));
-#endif
-							TS1H=htonl(SyncPacket->TS1H);
-							TS1L=htonl(SyncPacket->TS1L);
-						}
-						else if (SyncPacket->Count==1)
-						{
-							ClockSync1Received=true;
-#ifdef SHOW_RTP_INFO
-                            fprintf (stdout, "Clock sync 1 received %u %u - %u %u\n", htonl(SyncPacket->TS1H), htonl(SyncPacket->TS1L), htonl(SyncPacket->TS2H), htonl(SyncPacket->TS2L));
-#endif
-							TS1H=htonl(SyncPacket->TS1H);
-							TS1L=htonl(SyncPacket->TS1L);
-							TS2H=htonl(SyncPacket->TS2H);
-							TS2L=htonl(SyncPacket->TS2L);
-
-							// This message is an answer to our first sync message
-							// Latency is the current time (at which answer has been received) minus time at which CK0 was sent
-							// We pass here only if we are session initiator
-							MeasuredLatency = TimeCounter - TS1L;
-						}
-						else if (SyncPacket->Count==2)
-						{
-							ClockSync2Received=true;
-							TS1H=htonl(SyncPacket->TS1H);
-							TS1L=htonl(SyncPacket->TS1L);
-							TS2H=htonl(SyncPacket->TS2H);
-							TS2L=htonl(SyncPacket->TS2L);
-							TS3H=htonl(SyncPacket->TS3H);
-							TS3L=htonl(SyncPacket->TS3L);
-
-							// We pass here if we are session listener
-							MeasuredLatency = TimeCounter - TS2L;
-						}
+					else
+					{  // Reject invitation from other source
+						this->SendInvitationReply(true, false, SenderIP, SenderPort);
 					}
 				}
 			}
+			else
+			{
+				// TODO... (why should be receive an invitation if we are a session initiator) ?
+			}
 		}
-	}  // Data received on data socket
+		else if ((ReceptionBuffer[2] == 'O') && (ReceptionBuffer[3] == 'K'))
+		{  // Remote device accepted our invitation
+			*InvitationAccepted = true;
+		}
+		else if ((ReceptionBuffer[2] == 'N') && (ReceptionBuffer[3] == 'O'))
+		{  // Remote device rejected our invitation
+			*InvitationRejected = true;
+		}
+		else if ((ReceptionBuffer[2] == 'B') && (ReceptionBuffer[3] == 'Y'))
+		{  // Remote device closes the session
+			if (SenderIP == this->SessionPartnerIP)  // Only accept BY message from the connected partner
+			{
+				this->PartnerCloseSession();
+			}
+		}
+		return true;
+	}  // Data available on control socket
+	else return false;
+}  // CRTP_MIDI::ProcessControlSocket
+//---------------------------------------------------------------------------
 
-#ifdef SHOW_RTP_INFO
-	if (InvitationReceivedOnCtrl) fprintf (stdout, "Invitation received on Control port\n");
-	if (InvitationAcceptedOnCtrl) fprintf (stdout, "Invitation accepted on Control port\n");
-	if (InvitationRefusedOnCtrl) fprintf (stdout, "Invitation refused on Control port\n");
+void CRTP_MIDI::PartnerCloseSession(void)
+{
+	this->TimerRunning = false;     // Stop any timed event
+	if (this->IsInitiatorNode == false)
+	{
+		SessionState = SESSION_WAIT_INVITE_CTRL;
+	}
+	else
+	{
+		SessionState = SESSION_CLOSED;
+	}
+	this->PeerClosedSession = true;
+	this->SessionPartnerIP = 0;
+}  // CRTP_MIDI::PartnerCloseSession
+//---------------------------------------------------------------------------
 
-	if (InvitationReceivedOnData) fprintf (stdout, "Invitation received on Data port\n");
-	if (InvitationAcceptedOnData) fprintf (stdout, "Invitation accepted on Data port\n");
-	if (InvitationRefusedOnData) fprintf (stdout, "Invitation refused on Data port\n");
+void CRTP_MIDI::RunSession(void)
+{
+	bool TimerEvent = false;
+	unsigned int SenderIP;
+	unsigned short SenderPort;
+	int RecvSize;
+	unsigned char ReceptionBuffer[1024];
+	sockaddr_in SenderData;
+	TSyncPacket* SyncPacket;
+	TLongMIDIRTPMsg LRTPMessage;
+	sockaddr_in AdrEmit;
+	int RTPOutSize;
+	bool InvitationAcceptedOnCtrl;
+	bool InvitationRejectedOnCtrl;
+	bool InvitationAcceptedOnData;
+	bool InvitationRejectedOnData;
+	bool PacketReceivedOnControl;
+	bool PacketReceivedOnData;
 
-	if (ByeReceivedOnCtrl) fprintf (stdout, "BY received on Control port\n");
-	if (ByeReceivedOnData) fprintf (stdout, "BY received on Data port\n");
+#if defined (__TARGET_MAC__)
+	socklen_t fromlen;
+#endif
+#if defined (__TARGET_LINUX__)
+	socklen_t fromlen;
+#endif
+#if defined (__TARGET_WIN__)
+	int fromlen;
 #endif
 
-	// *** Non state related answers ***
-	if (ClockSync0Received)
-	{
-		SendSyncPacket(1, TS1H, TS1L, 0, TimeCounter, 0, 0);
-#ifdef SHOW_RTP_INFO
-		printf ("Sent clock 1 from non state related\n");
-#endif
-	}
+	// Computing time using the thread is not perfect, we should use OS time related data
+	// timeGetTime can be used on Windows, but no direct equivalent in Mac or Linux
+	this->TimeCounter += 10;
+	this->LocalClock += 10;
 
-	if ((ClockSync1Received)&&(SessionState==SESSION_OPENED))
-	{
-		TimeOutRemote = 4;				// Bug corrected 12/10/2021
-		SendSyncPacket(2, TS1H, TS1L, TS2H, TS2L, 0, TimeCounter);
-#ifdef SHOW_RTP_INFO
-		printf ("Sent clock 2 from state SESSION_OPENED\n");
-#endif
-	}
+	// Do not process if communication layers are not ready
+	if (this->SocketLocked) return;
 
-	if (ClockSync2Received)
+	// Check if timer elapsed
+	if (this->TimerRunning)
 	{
-		TimeOutRemote=4;
-		SessionState=SESSION_OPENED;
-		//PrepareTimerEvent(30000);
-	}
-
-	if (InvitationReceivedOnCtrl)
-	{
-        // TODO : send a NO if session is already opened with another remote entity
-		SendInvitationReply(true, true, 0);
-	}
-
-	if (InvitationReceivedOnData)
-	{
-        // TODO : send a NO if session is already opened with another remote entity
-		SendInvitationReply(false, true, 0);
-        if (IsInitiatorNode==false)
-        {
-            SessionPartnerIP=InvitationOnDataSenderIP;      // TODO : only if session is accepted and if we are Session Listener
-        }
-	}
-
-    // If we detect that remote node disconnects, restart the state machine accordingly to Session Initiator / Session Listener status
-	// TODO : only if sender IP is the one with which we have a connection
-	if ((ByeReceivedOnData)||(ByeReceivedOnCtrl))
-	{
-        TimerRunning=false;     // Stop any timed event
-		if (IsInitiatorNode==false) 
+		if (this->EventTime > 0)
+			this->EventTime--;
+		if (EventTime == 0)
 		{
-			SessionState=SESSION_WAIT_INVITE;
+			this->TimerRunning = false;
+			TimerEvent = true;
 		}
-		else
-		{
-			SessionState=SESSION_CLOSED; 
-		}
-		PeerClosedSession = true;
-        SessionPartnerIP=0;
 	}
 
-	// *** State machine manager ***
-	if (SessionState==SESSION_CLOSED)
+	// If we are being invited but invitation process does not complete in time, return to listener state
+	if ((TimerEvent) && (this->SessionState == SESSION_WAIT_INVITE_DATA))
 	{
-		return;
+		this->SessionState = SESSION_WAIT_INVITE_CTRL;
+	}
+	if ((TimerEvent) && (this->SessionState == SESSION_WAIT_CLOCK_SYNC))
+	{
+		this->SessionState = SESSION_WAIT_INVITE_CTRL;
 	}
 
-	// NOTE : we must process the SESSION_OPENED state, since it is used to send RTP-MIDI blocks
-	if (SessionState==SESSION_OPENED)
+	InvitationAcceptedOnCtrl = false;
+	InvitationRejectedOnCtrl = false;
+	InvitationAcceptedOnData = false;
+	InvitationRejectedOnData = false;
+	// We have to loop until control and data sockets are flushed, as this method is called every 1ms
+	// Otherwise we may introduce processing delays if there are bursts of packets to these ports
+	do
 	{
-		// Check if there is not a delay request (to avoid Kiss-Box output buffer overflow)
-		if (InterFragmentTimer>0)
+		PacketReceivedOnControl = this->ProcessControlSocket(&InvitationAcceptedOnCtrl, &InvitationRejectedOnCtrl);
+
+		// Process incoming packets on data socket
+		PacketReceivedOnData = false;
+		if (DataAvail(DataSocket, 0))
 		{
-			InterFragmentTimer--;
+			PacketReceivedOnData = true;
+			fromlen = sizeof(sockaddr_in);
+			RecvSize = (int)recvfrom(DataSocket, (char*)&ReceptionBuffer, sizeof(ReceptionBuffer), 0, (sockaddr*)&SenderData, &fromlen);
+
+			if (RecvSize > 0)
+			{
+				SenderIP = htonl(SenderData.sin_addr.s_addr);
+				SenderPort = htons(SenderData.sin_port);
+
+				if (SenderIP == this->SessionPartnerIP)
+				{
+					// Process incoming RTP-MIDI packet
+					if ((ReceptionBuffer[0] == 0x80) && (ReceptionBuffer[1] == 0x61))  // Check Apple RTP-MIDI packet signature
+					{
+						if (this->SessionState == SESSION_OPENED)
+						{
+							ProcessIncomingRTP(&ReceptionBuffer[0]);
+						}
+					}
+
+					else if ((ReceptionBuffer[0] == 0xFF) && (ReceptionBuffer[1] == 0xFF))
+					{
+						if ((ReceptionBuffer[2] == 'C') && (ReceptionBuffer[3] == 'K'))
+						{  // Process clock message first as they come more often than other session messages
+							SyncPacket = (TSyncPacket*)&ReceptionBuffer[0];
+
+							if (SyncPacket->Count == 0)
+							{
+								this->TS1H = htonl(SyncPacket->TS1H);
+								this->TS1L = htonl(SyncPacket->TS1L);
+								SendSyncPacket(1, this->TS1H, this->TS1L, 0, TimeCounter, 0, 0);
+							}
+							else if (SyncPacket->Count == 1)
+							{
+								this->TS1H = htonl(SyncPacket->TS1H);
+								this->TS1L = htonl(SyncPacket->TS1L);
+								this->TS2H = htonl(SyncPacket->TS2H);
+								this->TS2L = htonl(SyncPacket->TS2L);
+								this->MeasuredLatency = TimeCounter - TS1L;
+
+								this->TimeOutRemote = 4;
+								this->SendSyncPacket(2, TS1H, TS1L, TS2H, TS2L, 0, TimeCounter);
+								if ((this->IsInitiatorNode) && (SessionState == SESSION_CLOCK_SYNC1))
+								{
+									this->TimeOutRemote = 4;
+									this->SessionState = SESSION_OPENED;
+								}
+							}
+							else if (SyncPacket->Count == 2)
+							{
+								this->TS1H = htonl(SyncPacket->TS1H);
+								this->TS1L = htonl(SyncPacket->TS1L);
+								this->TS2H = htonl(SyncPacket->TS2H);
+								this->TS2L = htonl(SyncPacket->TS2L);
+								this->TS3H = htonl(SyncPacket->TS3H);
+								this->TS3L = htonl(SyncPacket->TS3L);
+								this->MeasuredLatency = TimeCounter - TS2L;
+								this->TimeOutRemote = 4;
+								this->SessionState = SESSION_OPENED;
+							}
+						}  // CK message
+						else if ((ReceptionBuffer[2] == 'I') && (ReceptionBuffer[3] == 'N'))
+						{  // Accept invitation
+							this->SessionState = SESSION_WAIT_CLOCK_SYNC;
+							PrepareTimerEvent(2000);
+							this->SendInvitationReply(false, true, SenderIP, SenderPort);
+							this->PartnerDataPort = SenderPort;
+						}
+						else if ((ReceptionBuffer[2] == 'O') && (ReceptionBuffer[3] == 'K'))
+						{  // Remote device accepted our invitation
+							InvitationAcceptedOnData = true;
+						}
+						else if ((ReceptionBuffer[2] == 'N') && (ReceptionBuffer[3] == 'O'))
+						{  // Remote device rejected our invitation
+							InvitationRejectedOnData = true;
+						}
+						else if ((ReceptionBuffer[2] == 'B') && (ReceptionBuffer[3] == 'Y'))
+						{
+							this->PartnerCloseSession();
+						}
+					}
+				}  // Packet sent from remote partner
+			}  // Received packet size > 0
+		}  // UDP packet available on data socket
+	} while (PacketReceivedOnControl||PacketReceivedOnData);
+
+	// Terminate the session if remote device has rejected our invitation
+	if (InvitationRejectedOnCtrl || InvitationRejectedOnData)
+	{
+		this->PartnerCloseSession();
+		this->ConnectionRefused = true;
+		// Just in case we got also a session accepted...
+		InvitationAcceptedOnData = false;
+		InvitationAcceptedOnCtrl = false;
+	}
+
+	// Run session initiator
+	if (this->IsInitiatorNode)
+	{
+		if (SessionState == SESSION_INVITE_CONTROL)
+		{
+			SyncSequenceCounter = 0;
+			if (InvitationAcceptedOnCtrl)
+			{
+				SessionState = SESSION_INVITE_DATA;
+				this->SendInvitation(false);
+				PrepareTimerEvent(100);
+				return;
+			}
+			else if (TimerRunning == false)
+			{
+				if (TimerEvent)
+				{  // Previous attempt has timed out
+					// Keep inviting until we get an answer
+					{
+						this->SendInvitation(true);
+						PrepareTimerEvent(1000);  // Wait one second before sending a new invitation
+						InviteCount++;
+					}
+				}
+			}
+		}  // Inviting on control port
+
+		else if (SessionState == SESSION_INVITE_DATA)
+		{
+			if (InvitationAcceptedOnData)
+			{
+				SessionState = SESSION_CLOCK_SYNC0;
+			}
+			else if (TimerRunning == false)
+			{
+				if (TimerEvent)
+				{  // Previous attempt has timed out
+					if (InviteCount > 12)
+					{  // No answer received from remote station after 12 attempts : stop invitation and go back to SESSION_INVITE_CONTROL
+						RestartSession();
+						return;
+					}
+					else
+					{
+						this->SendInvitation(false);
+						PrepareTimerEvent(1000);  // Wait one second before sending a new invitation
+						InviteCount++;
+						return;
+					}
+				}
+			}
 		}
 
-		// Check if any data waiting to be sent to network and no time still needed
-		if (InterFragmentTimer==0) RTPOutSize=PrepareMessage(&LRTPMessage, TimeCounter);
-		else RTPOutSize=0;
-		if (RTPOutSize>0)
+		else if (SessionState == SESSION_CLOCK_SYNC0)
 		{
-			RTPSequence++;  // Increment for next message
+			SendSyncPacket(0, 0, TimeCounter, 0, 0, 0, 0);
+			SessionState = SESSION_CLOCK_SYNC1;
+		}
+	}
+
+	// Process RTP communication and feedback when session is opened
+	if (this->SessionState == SESSION_OPENED)
+	{
+		RTPOutSize = PrepareMessage(&LRTPMessage, TimeCounter);
+		if (RTPOutSize > 0)
+		{
+			this->RTPSequence++;  // Increment for next message
 			// Send message on network
-			memset (&AdrEmit, 0, sizeof(sockaddr_in));
-			AdrEmit.sin_family=AF_INET;
-			AdrEmit.sin_addr.s_addr=htonl(RemoteIP);
-			AdrEmit.sin_port=htons(RemoteData);
+			memset(&AdrEmit, 0, sizeof(sockaddr_in));
+			AdrEmit.sin_family = AF_INET;
+			AdrEmit.sin_addr.s_addr = htonl(this->SessionPartnerIP);
+			AdrEmit.sin_port = htons(this->PartnerDataPort);
 			sendto(DataSocket, (const char*)&LRTPMessage, RTPOutSize, 0, (const sockaddr*)&AdrEmit, sizeof(sockaddr_in));
 		}
 
-		// Resynchronize clock with remote node every 30 seconds if we are initiator
-		if (TimerRunning==false)
+		// When session is opened, the timer keeps running
+		if (TimerEvent)
 		{
-			if (TimerEvent)
+			// Send a RS packet if we have received something meanwhile (do not send the RS if nothing has been received, it crashes the Apple driver)
+			if (this->LastRTPCounter != this->LastFeedbackCounter)
 			{
-				// Send a RS packet if we have received something meanwhile (do not send the RS if nothing has been received, it crashes the Apple driver)
-				if (LastRTPCounter!=LastFeedbackCounter)
-				{
-					SendFeedbackPacket(LastRTPCounter);
-					LastFeedbackCounter=LastRTPCounter;
-				}
+				this->SendFeedbackPacket(LastRTPCounter);
+				this->LastFeedbackCounter = this->LastRTPCounter;
+			}
 
-				if (IsInitiatorNode==true)
-				{  // Restart a synchronization sequence if we are session initiator
-					SendSyncPacket(0, 0, TimeCounter, 0, 0, 0, 0);
-				}
+			if (this->IsInitiatorNode == true)
+			{  // Restart a synchronization sequence if we are session initiator
+				this->SendSyncPacket(0, 0, TimeCounter, 0, 0, 0, 0);
+			}
 
-				// We send first a sync sequence 5 times every 1.5 seconds, then one sync sequence every 10 seconds
-				if (SyncSequenceCounter<=5)
-				{
-					PrepareTimerEvent(1500);
-					SyncSequenceCounter+=1;
-				}
-				else
-				{
-					PrepareTimerEvent(10000);
-				}
-				if (TimeOutRemote>0)
-					TimeOutRemote-=1;
-#ifdef SHOW_RTP_INFO
-				//printf ("TimeOutRemote = %d\n", TimeOutRemote);
-				printf ("Sent clock 0 from state SESSION_OPENED\n");
-#endif
+			// We send first a sync sequence 5 times every 1.5 seconds, then one sync sequence every 10 seconds
+			if (this->SyncSequenceCounter <= 5)
+			{
+				this->PrepareTimerEvent(1500);
+				this->SyncSequenceCounter += 1;
+			}
+			else
+			{
+				this->PrepareTimerEvent(10000);
+			}
+			if (this->TimeOutRemote > 0)
+				this->TimeOutRemote -= 1;
+		}
+
+		// If communication with remote device times out, we consider it has disconnected without sending BYE
+		if (this->TimeOutRemote == 0)
+		{
+			this->ConnectionLost = true;
+			if (this->IsInitiatorNode)
+			{  // Restart invitation sequence
+				this->TimeOutRemote = 4;
+				this->RestartSession();
+			}
+			else
+			{  // If we are not session initiator, just wait to be invited again
+				this->SessionState = SESSION_WAIT_INVITE_CTRL;
 			}
 		}
-		return;
-	}
-
-	// We are inviting remote node on control port
-	if (SessionState==SESSION_INVITE_CONTROL)
-	{
-		SyncSequenceCounter=0;
-		if (InvitationAcceptedOnCtrl)
-		{
-			SessionState=SESSION_INVITE_DATA;
-			this->SendInvitation(false);
-			PrepareTimerEvent(100);
-			return;
-		}
-		if (TimerRunning==false)
-		{
-			if (TimerEvent)
-			{  // Previous attempt has timed out
-				// Keep inviting until we get an answer
-				/*
-				if (InviteCount>12)
-				{  // No answer received from remote station after 12 attempts : stop invitation and go into SESSION_WAIT_INVITE
-					SessionState=SESSION_WAIT_INVITE;
-					return;
-				}
-				else
-				*/
-				{
-					this->SendInvitation(true);
-					PrepareTimerEvent(1000);  // Wait one second before sending a new invitation
-					InviteCount++;
-					return;
-				}
-			}
-		}
-		else {  /* We wait for an event : nothing to do */ }
-		return;
-	}
-
-	// We are inviting remote node on data port
-	if (SessionState==SESSION_INVITE_DATA)
-	{
-		if (InvitationAcceptedOnData)
-		{
-			SessionState=SESSION_CLOCK_SYNC0;
-			return;
-		}
-		if (TimerRunning==false)
-		{
-			if (TimerEvent)
-			{  // Previous attempt has timed out
-				if (InviteCount>12)
-				{  // No answer received from remote station after 12 attempts : stop invitation and go back to SESSION_INVITE_CONTROL
-					RestartSession();
-					return;
-				}
-				else
-				{
-					this->SendInvitation(false);
-					PrepareTimerEvent(1000);  // Wait one second before sending a new invitation
-					InviteCount++;
-					return;
-				}
-			}
-		}
-		else {  /* We wait for an event : nothing to do */ }
-		return;
-	}
-
-	if (SessionState==SESSION_WAIT_INVITE)
-	{
-		return;
-	}
-
-	if (SessionState==SESSION_CLOCK_SYNC0)
-	{
-		SendSyncPacket(0, 0, TimeCounter, 0, 0, 0, 0);
-		SessionState=SESSION_CLOCK_SYNC1;
-#ifdef SHOW_RTP_INFO
-		printf ("Sent clock 0 from state SESSION_CLOCK_SYNC0\n");
-#endif
-		return;
-	}
-
-	if (SessionState==SESSION_CLOCK_SYNC1)
-	{
-#ifdef SHOW_RTP_INFO
-		printf ("Received clock 1 from state SESSION_CLOCK_SYNC1\n");
-#endif
-		if (ClockSync1Received) SessionState=SESSION_CLOCK_SYNC2;
-		return;
-	}
-
-	if (SessionState==SESSION_CLOCK_SYNC2)
-	{
-		SendSyncPacket(2, TS1H, TS1L, TS2H, TS2L, 0, TimeCounter);
-		SessionState=SESSION_OPENED;
-#ifdef SHOW_RTP_INFO
-		printf ("Sent clock 2 from state SESSION_CLOCK_SYNC2\n");
-#endif
-		return;
-	}
+	}  // Session is opened
 }  // CRTP_MIDI::RunSession
 //---------------------------------------------------------------------------
 
@@ -678,13 +629,8 @@ int CRTP_MIDI::GeneratePayload (unsigned char* MIDIList)
 {
 	unsigned int MIDIBlockEnd;			// Index of last MIDI byte in FIFO to transmit
 	bool FullPayload;					// RTP payload block full of data
-	//unsigned char StatusByte;
-	//unsigned int CodeMIDI;
 	int CtrBytePayload;					// Counter of RTP payload bytes
 	unsigned int TempPtr;
-	//unsigned int Count;
-	//unsigned int SysexLen;
-	//unsigned int RemainingBytes;
 
 	CtrBytePayload=0;
 	FullPayload=false;
@@ -792,7 +738,6 @@ unsigned int CRTP_MIDI::GetLatency (void)
 void CRTP_MIDI::RestartSession (void)
 {
 	if (this->IsInitiatorNode == false) return;
-	//if (this->SessionState != SESSION_CLOSED) return;
 
 	SYSEX_RTPActif=false;
 	SegmentSYSEXInput=false;
@@ -806,21 +751,45 @@ void CRTP_MIDI::RestartSession (void)
 
 bool CRTP_MIDI::ReadAndResetConnectionLost (void)
 {
-	if (ConnectionLost==false) return false;
+	if (this->ConnectionLost==false) return false;
 
-	ConnectionLost=false;
+	this->ConnectionLost=false;
 	return true;
-}
+}  // CRTP_MIDI::ReadAndResetConnectionLost
 //--------------------------------------------------------------------------
 
-bool CRTP_MIDI::RemotePeerClosedSession (void)
+bool CRTP_MIDI::RemotePeerHasClosedSession (void)
 {
 	bool ReadValue;
 
-	ReadValue = PeerClosedSession;
-	PeerClosedSession = false;
+	ReadValue = this->PeerClosedSession;
+	this->PeerClosedSession = false;
 
 	return ReadValue;
 }  // CRTP_MIDI::RemotePeerClosedSession
 //--------------------------------------------------------------------------
 
+bool CRTP_MIDI::RemotePeerHasRefusedSession(void)
+{
+	bool ReadValue;
+
+	ReadValue = this->ConnectionRefused;
+	this->ConnectionRefused = false;
+
+	return ReadValue;
+}  // CRTP_MIDI::RemotePeerHasRefusedSession
+//--------------------------------------------------------------------------
+
+void CRTP_MIDI::SetCallback(TRTPMIDIDataCallback CallbackFunc, void* UserInstance)
+{
+	bool SocketState = this->SocketLocked;
+
+	this->SocketLocked = false;		// Block processing to avoid callbacks while we configure them
+
+	this->ClientInstance = UserInstance;
+	this->RTPCallback = CallbackFunc;
+
+	// Restore lock state
+	this->SocketLocked = SocketState;
+}  // CRTP_MIDI::SetCallback
+//--------------------------------------------------------------------------

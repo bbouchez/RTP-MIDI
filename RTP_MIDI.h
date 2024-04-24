@@ -58,11 +58,14 @@
 #define SESSION_CLOSE			1	// Session should close in emergency
 #define SESSION_INVITE_CONTROL	2	// Sending invitation on control port
 #define SESSION_INVITE_DATA		3	// Sending invitation on data port
-#define SESSION_WAIT_INVITE		4	// Wait to be invited by remote station
 #define SESSION_CLOCK_SYNC0		5	// Send first synchro message and wait answer (CK0)
 #define SESSION_CLOCK_SYNC1		6   // Wait for CK1 message from remote node
 #define SESSION_CLOCK_SYNC2		7	// Send second synchro message (CK2)
 #define SESSION_OPENED			8	// Session is opened, just generate background traffic now
+
+#define SESSION_WAIT_INVITE_CTRL		10	// Wait to be invited by remote station on control port
+#define SESSION_WAIT_INVITE_DATA		11	// Wait to be invited by remote station on data port
+#define SESSION_WAIT_CLOCK_SYNC			12  // Wait to receive CK2 message to confirm session is fully opened by remote initiator
 
 #pragma pack (push, 1)
 typedef struct {
@@ -228,7 +231,14 @@ public:
 
 	//! Returns true if remote participant has sent a BY to close the session
 	//! The flag is reset after this method has been called (so the method returns true only one time)
-	bool RemotePeerClosedSession (void);
+	bool RemotePeerHasClosedSession (void);
+
+	//! Returns true if remote participant has rejected the invitation to session
+	//! The flag is reset after this method has been called (so the method returns true only one time)
+	bool RemotePeerHasRefusedSession(void);
+
+	//! Declares callback and instance parameter for the callback
+	void SetCallback (TRTPMIDIDataCallback CallbackFunc, void* UserInstance);
 
 private:
 	// Callback data
@@ -237,23 +247,16 @@ private:
 
 	unsigned char SessionName [MAX_SESSION_NAME_LEN];
 
-	unsigned int RemoteIP;			// Address of remote computer (0 if module is used as session listener)
-	unsigned short RemoteControl;	// Remote control port number (0 if module is used as session listener)
-	unsigned short RemoteData;		// Remote data port number (0 if module is used as session listener)
-	//unsigned short LocalControl;	// Local control port number
-	//unsigned short LocalData;		// Local data port number
-
-    unsigned int InvitationOnCtrlSenderIP;      // IP address of sender of invitation received on control port
-    unsigned int InvitationOnDataSenderIP;      // IP address of sender of invitation received on data port
-    unsigned int SessionPartnerIP;              // IP address of session partner (only valid if session is opened)
-    unsigned int CheckerIP;                     // IP address of device checking genuine KB software
+	unsigned int RemoteIPToInvite;				// Address of remote computer (0 if module is used as session listener)
+	unsigned int SessionPartnerIP;              // IP address of session partner
+	unsigned short PartnerControlPort;			// Remote control port number (0 if module is used as session listener)
+	unsigned short PartnerDataPort;				// Remote data port number (0 if module is used as session listener)
 
 	TSOCKTYPE ControlSocket;
 	TSOCKTYPE DataSocket;
 
 	bool SocketLocked;
 	unsigned int SSRC;
-	unsigned int Token;
 	unsigned short RTPSequence;
 	unsigned short LastRTPCounter;		// Last packet counter received from session partner
 	unsigned short LastFeedbackCounter;	// Last packet counter sent back in the RS packet
@@ -267,16 +270,11 @@ private:
 	unsigned int MeasuredLatency;
 
 	bool TimerRunning;				// Event timer is running
-	bool TimerEvent;				// Event is signalled
-	unsigned int EventTime;		// System time to which event will be signalled
+	unsigned int EventTime;			// Time to which event will be signalled
 
 	unsigned int TimeCounter;		// Counter in 100us used for clock synchronization
 
 	TMIDI_FIFO_CHAR RTPStreamQueue;		// Streaming MIDI messages with precomputed RTP deltatime
-
-	bool BlocSYSEX_RTP;			// Marks that we are placing a SYSEX event in an RTP block
-	unsigned int InterFragmentTimer;	// Number of milliseconds before we can send the next RTP block
-	unsigned int TransmittedSYSEXInFragment;		// Number of SYSEX data already transmitted in fragments
 
 	// Decoding variables for incoming RTP message
 	bool SYSEX_RTPActif;			// We are receiving a SYSEX message from network
@@ -300,15 +298,15 @@ private:
 
 	bool ConnectionLost;				// Set to 1 when connection is lost after a session has opened successfully
 	bool PeerClosedSession;				// Set to 1 when we receive a BY message on a opened session
+	bool ConnectionRefused;				// Set to 1 when remote device refuses the invitation
 
 	void CloseSockets(void);
 	void SendInvitation (bool DestControl);
 
 	//! Sends an answer to an invitation
-	// Accept=true : invitation accepted
-	// Accept=false : invitation rejected
-	// Name==NULL : Name is not transmitted in the answer
-	void SendInvitationReply (bool OnControl, bool Accept, char* Name);
+	//! \param Accept true : send invitation accepted message, false : send invitation rejected message
+	void SendInvitationReply (bool FromControlSocket, bool Accept, unsigned int DestinationIP, unsigned short DestinationPort);
+
 	void SendSyncPacket (char Count, unsigned int TS1H, unsigned int TS1L, unsigned int TS2H, unsigned int TS2L, unsigned int TS3H, unsigned int TS3L);
 	void SendBYCommand (void);
 
@@ -316,9 +314,6 @@ private:
 	void SendFeedbackPacket (unsigned short LastNumber);
 
 	void PrepareTimerEvent (unsigned int TimeToWait);
-
-	//! Create a MIDI code in Windows format
-	unsigned int PrepareCodeMIDI (char data1, char data2, char data3);
 
 	//! Extracts and return delta time stored in network buffer
 	/*!
@@ -353,6 +348,13 @@ private:
 
 	//! Send the MIDI message to client (max 3 bytes)
 	void sendMIDIToClient (unsigned int NumBytes, unsigned int DeltaTime);
+	
+	//! Process communication on Control socket (processing of incoming invitations)
+	//! \return true if a packet has been received on control port socket
+	bool ProcessControlSocket(bool* InvitationAccepted, bool* InvitationRejected);
+
+	//! Remote partner has asked to close the session
+	void PartnerCloseSession(void);
 };
 
 #endif
