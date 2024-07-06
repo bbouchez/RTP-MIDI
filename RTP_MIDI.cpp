@@ -72,6 +72,12 @@
 
 16/04/2024
   - added SetCallback method to declare callback and instance outside from constructor
+
+30/06/2024
+  - renamed SocketLocked to EndpointLocked
+  - bug corrected in SetCallback : endpoint was not locked when callback was set
+  - endpoint is now locked when CloseSession is called to allow multiple activation/deactivation
+  - init of first timer after session opening is set to 1 ms (otherwise invitation is delayed...)
  */
 
 #include "RTP_MIDI.h"
@@ -99,7 +105,7 @@ CRTP_MIDI::CRTP_MIDI(unsigned int SYXInSize, TRTPMIDIDataCallback CallbackFunc, 
     SessionPartnerIP=0;
 	strcpy ((char*)&this->SessionName[0], "");
 
-	SocketLocked=true;
+	EndpointLocked=true;
 	TimerRunning=false;
 	EventTime=0;
 
@@ -207,8 +213,8 @@ int CRTP_MIDI::InitiateSession(unsigned int DestIP,
 			SessionState=SESSION_INVITE_CONTROL;
             SessionPartnerIP=RemoteIPToInvite;
 		}
-		SocketLocked=false;		// Must be last instruction after session initialization
-		PrepareTimerEvent(1000);
+		PrepareTimerEvent(1);
+		EndpointLocked=false;		// Must be last instruction after session initialization
 	}
 
 	return CreateError;
@@ -223,8 +229,11 @@ void CRTP_MIDI::CloseSession (void)
 		if (this->SessionState == SESSION_WAIT_INVITE_CTRL) return;
 	}
 
+	if (EndpointLocked) return;
+
 	// Send the message in all other cases, even if we are still in invitation process
-	SessionState=SESSION_CLOSED;
+	SessionState = SESSION_CLOSED;
+	EndpointLocked = true;
 	SendBYCommand();
 	SystemSleepMillis(50);		// Give time to send the message before closing the sockets
 }  // CRTP_MIDI::CloseSession
@@ -369,7 +378,7 @@ void CRTP_MIDI::RunSession(void)
 	this->LocalClock += 10;
 
 	// Do not process if communication layers are not ready
-	if (this->SocketLocked) return;
+	if (this->EndpointLocked) return;
 
 	// Check if timer elapsed
 	if (this->TimerRunning)
@@ -782,14 +791,14 @@ bool CRTP_MIDI::RemotePeerHasRefusedSession(void)
 
 void CRTP_MIDI::SetCallback(TRTPMIDIDataCallback CallbackFunc, void* UserInstance)
 {
-	bool SocketState = this->SocketLocked;
+	bool SocketState = this->EndpointLocked;
 
-	this->SocketLocked = false;		// Block processing to avoid callbacks while we configure them
+	this->EndpointLocked = true;		// Block processing to avoid callbacks while we configure them
 
 	this->ClientInstance = UserInstance;
 	this->RTPCallback = CallbackFunc;
 
 	// Restore lock state
-	this->SocketLocked = SocketState;
+	this->EndpointLocked = SocketState;
 }  // CRTP_MIDI::SetCallback
 //--------------------------------------------------------------------------

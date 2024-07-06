@@ -255,7 +255,7 @@ private:
 	TSOCKTYPE ControlSocket;
 	TSOCKTYPE DataSocket;
 
-	bool SocketLocked;
+	bool EndpointLocked;
 	unsigned int SSRC;
 	unsigned short RTPSequence;
 	unsigned short LastRTPCounter;		// Last packet counter received from session partner
