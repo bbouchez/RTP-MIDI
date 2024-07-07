@@ -54,7 +54,7 @@
 10/04/2023
   - Added automatic port numbering (N+1) when local port is set to 0 (rather two random port numbers) in InitiateSession
   - Remove LocalCtrlPort and LocalDataPort members (not used anywhere)
-  
+
 24/06/2023
   - Moved TS1L, TS1H, TS2L, TS2H, TS3L, TS3H from stack to class members (SessionState==SESSION_CLOCK_SYNC2 uses them after they have been defined from a previous realtime call)
 
@@ -78,6 +78,9 @@
   - bug corrected in SetCallback : endpoint was not locked when callback was set
   - endpoint is now locked when CloseSession is called to allow multiple activation/deactivation
   - init of first timer after session opening is set to 1 ms (otherwise invitation is delayed...)
+
+07/07/2024
+  - added Session Name field in Invitation Reply
  */
 
 #include "RTP_MIDI.h"
