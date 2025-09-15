@@ -682,8 +682,9 @@ int CRTP_MIDI::PrepareMessage (TLongMIDIRTPMsg* Buffer, unsigned int TimeStamp)
 	Buffer->Header.Code2=0x61;
 
 	// Long MIDI list : B=1
+	// Deltatime before first byte : Z=1
 	// Phantom = 0 (status byte always included)
-	Buffer->Payload.Control=htons((unsigned short)TailleMIDI|LONG_B_BIT);
+	Buffer->Payload.Control=htons((unsigned short)TailleMIDI|LONG_B_BIT|LONG_Z_BIT);
 
 	Buffer->Header.SequenceNumber=htons(RTPSequence);
 	Buffer->Header.Timestamp=htonl(TimeStamp);

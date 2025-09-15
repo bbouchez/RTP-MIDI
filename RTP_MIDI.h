@@ -206,7 +206,8 @@ public:
 	//! Main processing function to call from high priority thread (audio or multimedia timer) every millisecond
 	void RunSession(void);
 
-	//! Send a RTP-MIDI block (with leading delta-times)
+	//! Send a RTP-MIDI block. A deltatime (even if null) MUST be provided in front of the MIDI data
+	// E.g : a B0 40 7F Control Change message must be passed as an aray of 4 bytes : 0x00 (deltatime), 0xB0, 0x40, 0x7F 
 	bool SendRTPMIDIBlock (unsigned int BlockSize, unsigned char* MIDIData);
 
 	//! Returns the session status
