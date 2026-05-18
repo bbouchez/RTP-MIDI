@@ -698,7 +698,8 @@ int CRTP_MIDI::getSessionStatus (void)
 	if (SessionState==SESSION_CLOSED) return 0;
 	if (SessionState==SESSION_OPENED) return 3;
 	if ((SessionState==SESSION_INVITE_DATA)||(SessionState==SESSION_INVITE_CONTROL)) return 1;
-	return 2;
+	if ((SessionState == SESSION_WAIT_INVITE_CTRL) || (SessionState == SESSION_WAIT_INVITE_DATA)) return 2;
+	return 5;
 }  // CRTP_MIDI::getSessionStatus
 //--------------------------------------------------------------------------
 
